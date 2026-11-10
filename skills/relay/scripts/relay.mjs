@@ -56,8 +56,14 @@ function ensureDir() {
 
 // ---------- database ----------
 let _db;
+// Only start and join may create relay state. Everything else needs an existing session here.
+let CREATE_OK = false;
 function db() {
   if (_db) return _db;
+  if (!CREATE_OK && !fs.existsSync(DB_PATH)) {
+    throw new Error(`no relay session in ${path.dirname(DIR)}\n` +
+      'Run this from the repo where you ran /relay start or /relay join (relay state lives in that repo\'s .relay folder).');
+  }
   ensureDir();
   _db = new DatabaseSync(DB_PATH);
   _db.exec(`
@@ -513,6 +519,7 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { flags, pos } = parseFlags(rest);
+  CREATE_OK = cmd === 'start' || cmd === 'join';
 
   switch (cmd) {
     case '_serve': return serve(Number(pos[0]));
@@ -646,7 +653,7 @@ async function main() {
     }
 
     case 'status': {
-      if (!fs.existsSync(DB_PATH) || !get('session_id')) return console.log('no session in ' + DIR);
+      if (!fs.existsSync(DB_PATH) || !get('session_id')) return console.log(`no relay session in ${path.dirname(DIR)}`);
       const c = (t, w = '') => db().prepare(`SELECT COUNT(*) AS n FROM ${t} ${w}`).get().n;
       console.log(JSON.stringify({
         state_dir: DIR, session: get('session_id').slice(0, 8), role: get('role'), mode: get('mode'),
@@ -661,6 +668,7 @@ async function main() {
 
     case 'stop':
     case 'close': {
+      if (!fs.existsSync(DIR)) return console.log(`no relay session in ${path.dirname(DIR)}`);
       killPid('tunnel.pid');
       killPid('server.pid');
       if (cmd === 'close' && flags.purge) {
