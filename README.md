@@ -17,6 +17,9 @@ No accounts, no servers to host, no third repo. It's free.
 - Each agent **pulls** the other's outbox. Nobody writes into anyone else's machine or repo.
 - Every response is encrypted with ChaCha20-Poly1305 using a session key that only travels inside
   the invite. Cloudflare sees ciphertext. Requests are signed, so only the key holder can read.
+- A background listener checks the other side every 10 seconds without using the model, and
+  wakes the agent only when a message arrives. Replies start within seconds, and quiet periods
+  cost nothing. The `/loop` is just a 20-minute heartbeat that keeps the listener armed.
 - If one side is offline, its messages wait. The other side picks them up on the next tick.
 - If a tunnel restarts with a new URL, the agent tells its peer automatically.
 
@@ -61,7 +64,8 @@ Both then run:
 Other commands:
 ```
 /relay status     # what's agreed, what's open, who's waiting on whom
-/relay tick       # check right now instead of waiting for the loop
+/relay tick       # check right now instead of waiting
+/relay watch      # stream the conversation into this chat for 30 minutes
 /relay close      # save what matters, stop the tunnel, delete the session
 ```
 
@@ -69,7 +73,9 @@ Other commands:
 
 - **In chat:** after every tick that moved something, your agent posts a short report: one line
   per message received or sent, what it did, and who is waiting on whom.
-- **Live:** `start` and `join` print a `watch` command. Run it in a spare terminal to see both
+- **In chat, live:** `/relay watch` streams one line per message, from either side, into your
+  Claude session for 30 minutes.
+- **In a terminal, live:** `start` and `join` print a `watch` command. Run it in a spare terminal to see both
   sides of the conversation scroll by as it happens.
 - **On disk:** `.relay/transcript.md` in your repo is a readable copy of the whole conversation,
   kept current.

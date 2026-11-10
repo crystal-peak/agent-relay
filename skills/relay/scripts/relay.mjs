@@ -324,8 +324,22 @@ async function waitPublic(url, maxS = 90) {
   throw new Error(`tunnel ${url} was not reachable after ${maxS}s; see ${path.join(DIR, 'tunnel.log')}`);
 }
 
+// Serialize up() across processes (a listener and a tick may overlap) with a lock directory.
+async function withUpLock(fn) {
+  const lock = path.join(DIR, 'up.lock');
+  for (let i = 0; i < 240; i++) {
+    try { fs.mkdirSync(lock); break; }
+    catch {
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 180_000) { fs.rmSync(lock, { recursive: true, force: true }); continue; } } catch {}
+      await sleep(500);
+    }
+  }
+  try { return await fn(); } finally { try { fs.rmSync(lock, { recursive: true, force: true }); } catch {} }
+}
+const up = () => withUpLock(upUnlocked);
+
 // Bring server + tunnel up if needed. Returns { url, changed }.
-async function up() {
+async function upUnlocked() {
   await startServer();
   const before = get('own_url');
   if (get('mode') === 'local') {
@@ -442,33 +456,51 @@ function printLive(m) {
   console.log(`\n${c('2', t)}  ${dir}  ${c('1', m.type)} #${m.id}${m.re ? c('2', ` re #${m.re}`) : ''}`);
   console.log(m.body.split('\n').map((l) => '  ' + l).join('\n'));
 }
-async function watch(flags) {
+// One line per message, for event streams (Claude Code's Monitor turns each line into a notification).
+function printCompact(m) {
+  const t = new Date(m.created_at).toISOString().slice(11, 19);
+  const gist = m.body.replace(/\s+/g, ' ').trim();
+  console.log(`relay ${t}Z ${m.who === 'you' ? 'you→peer' : 'peer→you'} #${m.id} [${m.type}]${m.re ? ` re #${m.re}` : ''} ${gist.length > 160 ? gist.slice(0, 157) + '...' : gist}`);
+}
+// watch:  human view of both sides (or --compact one-liners).
+// listen: event stream for an agent: only new peer messages, one line each, nothing else on stdout.
+//         Also keeps this side's server and tunnel alive between heartbeat ticks.
+async function watch(flags, { listen = false } = {}) {
   session();
-  const last = flags.all ? Infinity : Number(flags.last || 5);
-  const rows = allRows();
-  if (rows.length > last) console.log(c('2', `(${rows.length - last} earlier messages hidden; --all shows everything)`));
-  for (const m of rows.slice(-last)) printLive(m);
+  const compact = listen || !!flags.compact;
+  const show = compact ? printCompact : printLive;
+  if (!listen) {
+    const last = flags.all ? Infinity : Number(flags.last ?? (compact ? 0 : 5));
+    const rows = allRows();
+    if (rows.length > last && !compact) console.log(c('2', `(${rows.length - last} earlier messages hidden; --all shows everything)`));
+    if (last > 0) for (const m of rows.slice(-last)) show(m);
+  }
   let maxOut = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM outbox').get().n;
   let maxIn = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM inbox').get().n;
-  const pullEvery = Math.max(5, Number(flags.every || 15));
-  console.log(c('2', `\n— watching. Checks the peer every ${pullEvery}s and shows both sides as messages land. Ctrl-C to stop. —`));
-  let lastState = null, lastPull = 0;
+  const pullEvery = Math.max(5, Number(flags.every || (listen ? 10 : 15)));
+  if (!compact) console.log(c('2', `\n— watching. Checks the peer every ${pullEvery}s and shows both sides as messages land. Ctrl-C to stop. —`));
+  let lastState = null, lastPull = 0, lastUp = Date.now();
   for (;;) {
+    if (!fs.existsSync(DB_PATH)) { if (!compact) console.log('session closed'); return; }
+    if (listen && Date.now() - lastUp >= 120_000) {
+      lastUp = Date.now();
+      try { const u = await up(); if (u.changed && get('peer_url')) await announce(); } catch {}
+    }
     if (Date.now() - lastPull >= pullEvery * 1000) {
       lastPull = Date.now();
       const p = await pull().catch((e) => ({ reachable: false, error: e.message }));
       const state = p.reachable ? 'up' : `down: ${p.error}`;
-      if (state !== lastState) {
+      if (state !== lastState && !compact) {
         console.log(c('2', `\n· ${new Date().toLocaleTimeString()} peer ${p.reachable ? 'reachable' : 'unreachable (' + p.error + ')'}`));
-        lastState = state;
       }
+      lastState = state;
     }
     const fresh = [
-      ...db().prepare("SELECT 'you' AS who, * FROM outbox WHERE id > ?").all(maxOut),
+      ...(listen ? [] : db().prepare("SELECT 'you' AS who, * FROM outbox WHERE id > ?").all(maxOut)),
       ...db().prepare("SELECT 'peer' AS who, * FROM inbox WHERE id > ?").all(maxIn),
     ].sort((a, b) => a.created_at.localeCompare(b.created_at));
     for (const m of fresh) {
-      printLive(m);
+      show(m);
       if (m.who === 'you') maxOut = Math.max(maxOut, m.id); else maxIn = Math.max(maxIn, m.id);
     }
     await sleep(2000);
@@ -505,7 +537,10 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
   inbox [--all]              Show unhandled (or all) received messages.
   ack <id...>                Mark received messages handled.
   brief [TEXT]               Show or append operator instructions (persist across context resets).
-  watch [--last N|--all]     Live view of the conversation, both directions, as it happens.
+  watch [--last N|--all] [--compact]
+                             Live view of the conversation, both directions, as it happens.
+  listen [--every S]         Event stream for agents: one line per new peer message, checked every
+                             S seconds (default 10). Also keeps the tunnel alive. Runs until stopped.
   log                        Full transcript, both directions, in time order.
                              A readable copy is kept current at .relay/transcript.md.
   status                     Session, URLs, process health, counts.
@@ -618,6 +653,7 @@ async function main() {
     }
 
     case 'watch': return watch(flags);
+    case 'listen': return watch(flags, { listen: true });
 
     case 'inbox': {
       const rows = flags.all ? db().prepare('SELECT * FROM inbox ORDER BY id').all() : unhandled();
