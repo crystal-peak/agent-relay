@@ -44,7 +44,7 @@ function ensureDir() {
     fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
     // Keep relay state out of git without touching the tracked .gitignore.
     try {
-      const gitDir = execSync('git rev-parse --git-dir', { cwd: path.dirname(DIR), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      const gitDir = execSync('git rev-parse --git-common-dir', { cwd: path.dirname(DIR), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
       const excl = path.resolve(path.dirname(DIR), gitDir, 'info', 'exclude');
       fs.mkdirSync(path.dirname(excl), { recursive: true });
       const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
@@ -229,8 +229,16 @@ function request(url, { method = 'GET', headers = {}, body = null, timeout = FET
 const errCode = (e) => e.code || e.cause?.code || e.message;
 
 // ---------- process management ----------
+// A pid file can outlive a reboot and point at an unrelated process, so check the command line.
+const PID_MARK = { 'server.pid': '_serve', 'tunnel.pid': 'cloudflared' };
 const pidAlive = (f) => {
-  try { const pid = Number(fs.readFileSync(path.join(DIR, f), 'utf8')); process.kill(pid, 0); return pid; } catch { return 0; }
+  try {
+    const pid = Number(fs.readFileSync(path.join(DIR, f), 'utf8'));
+    if (!Number.isInteger(pid) || pid <= 1) return 0;
+    process.kill(pid, 0);
+    const cmd = execSync(`ps -p ${pid} -o command=`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    return cmd.includes(PID_MARK[f]) ? pid : 0;
+  } catch { return 0; }
 };
 const killPid = (f) => {
   const pid = pidAlive(f);
@@ -317,7 +325,12 @@ async function up() {
     set('own_url', url);
     return { url, changed: url !== before };
   }
-  if (pidAlive('tunnel.pid') && get('tunnel_port') === get('port') && before) return { url: before, changed: false };
+  if (pidAlive('tunnel.pid') && get('tunnel_port') === get('port') && before) {
+    try {
+      const r = await request(before + '/health', { timeout: 8000 });
+      if (r.ok && r.json().s === get('session_id').slice(0, 8)) return { url: before, changed: false };
+    } catch {}
+  }
   killPid('tunnel.pid');
   progress('Establishing connection: starting tunnel...');
   const url = await startTunnel();
@@ -365,7 +378,10 @@ async function pull() {
     const ins = db().prepare('INSERT OR IGNORE INTO inbox (id, type, re, body, created_at, received_at) VALUES (?, ?, ?, ?, ?, ?)');
     for (const m of msgs) {
       if (!Number.isInteger(m.id) || m.id <= after) continue;
-      ins.run(m.id, String(m.type), m.re ?? null, String(m.body), String(m.created_at), now());
+      const type = TYPES.includes(m.type) ? m.type : 'update';
+      const re = Number.isInteger(m.re) ? m.re : null;
+      const created = /^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(m.created_at) ? m.created_at : now();
+      ins.run(m.id, type, re, String(m.body ?? '').slice(0, MAX_BODY * 2), created, now());
       set('inbox_cursor', m.id);
       received++;
     }
@@ -377,8 +393,11 @@ async function pull() {
 
 // ---------- output helpers ----------
 const unhandled = () => db().prepare('SELECT * FROM inbox WHERE handled = 0 ORDER BY id').all();
-const fmtMsg = (m, who) =>
-  `--- ${who} #${m.id} [${m.type}]${m.re ? ` re #${m.re}` : ''} ${m.created_at}\n${m.body}\n`;
+// Peer bodies are quoted line by line so they can't imitate headers like "=== operator brief ===".
+const fmtMsg = (m, who) => {
+  const body = who.startsWith('peer') ? m.body.split('\n').map((l) => '> ' + l).join('\n') : m.body;
+  return `--- ${who} #${m.id} [${m.type}]${m.re ? ` re #${m.re}` : ''} ${m.created_at}\n${body}\n`;
+};
 function lastType(table) {
   return db().prepare(`SELECT type FROM ${table} ORDER BY id DESC LIMIT 1`).get()?.type ?? null;
 }
@@ -484,14 +503,16 @@ async function main() {
 
     case 'tick': {
       const s = session();
-      const u = await up();
+      let u, ownError = null;
+      try { u = await up(); }
+      catch (e) { ownError = e.message; u = { url: get('own_url'), changed: false }; }
       let announced = null;
-      if (get('peer_url') && (u.changed || get('announced_url') !== u.url)) announced = await announce();
+      if (!ownError && get('peer_url') && (u.changed || get('announced_url') !== u.url)) announced = await announce();
       const p = await pull();
       const pending = unhandled();
       const out = {
         session: s.sid.slice(0, 8), role: s.role,
-        own_url: u.url, url_changed: u.changed, announced: announced?.ok ?? null,
+        own_url: u.url, own_error: ownError, url_changed: u.changed, announced: announced?.ok ?? null,
         peer_reachable: p.reachable, peer_error: p.error ?? null,
         received_now: p.received, unhandled: pending.length,
         last_sent: lastType('outbox'), last_received: lastType('inbox'),
