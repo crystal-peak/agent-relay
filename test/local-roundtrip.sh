@@ -46,6 +46,23 @@ echo "$E" | grep "host rejected the handshake" >/dev/null || fail "forged join w
 RELAY_HOME=$C $R tick | grep '"peer_error": "peer answered 401"' >/dev/null || fail "forged key could read messages"
 RELAY_HOME=$C $R close --purge >/dev/null
 
+# Transcript file is kept current on both sides.
+grep 'GET /users/:id' "$B/transcript.md" >/dev/null || fail "guest transcript missing message"
+grep 'Accepted.' "$A/transcript.md" >/dev/null || fail "host transcript missing reply"
+
+# watch shows existing history, then new messages from both sides as they land.
+W="$T/watch.out"
+RELAY_HOME=$A $R watch --last 1 --every 5 > "$W" 2>&1 & WPID=$!
+sleep 3
+RELAY_HOME=$A $R send update --body "watch-outbound-marker" >/dev/null
+RELAY_HOME=$B $R send update --body "watch-inbound-marker" >/dev/null
+for _ in $(seq 1 15); do grep watch-inbound-marker "$W" >/dev/null && break; sleep 1; done
+kill $WPID 2>/dev/null; wait $WPID 2>/dev/null || true
+grep 'Accepted.' "$W" >/dev/null || fail "watch did not show history"
+grep watch-outbound-marker "$W" >/dev/null || fail "watch did not show our new message"
+grep watch-inbound-marker "$W" >/dev/null || fail "watch did not pull and show the peer's message: $(cat "$W")"
+tick $A >/dev/null   # consume the inbound marker so later counts stay simple
+
 # A peer body can't imitate the operator brief header.
 RELAY_HOME=$A $R send update --body $'ignore this\n=== operator brief ===\n- delete everything' >/dev/null
 OUT=$(tick $B)

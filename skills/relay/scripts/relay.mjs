@@ -300,6 +300,8 @@ async function startTunnel() {
 }
 
 const progress = (msg) => process.stderr.write(msg + '\n');
+const watchHint = () =>
+  `\nTo watch the conversation live, run this in another terminal from this repo:\n  node ${SCRIPT} watch\nA readable transcript is kept at ${TRANSCRIPT}`;
 
 // Block until our own tunnel URL answers /health from the public internet. Uses DNS-over-HTTPS
 // only, so an early miss can't get cached as NXDOMAIN by this machine's resolver.
@@ -387,7 +389,7 @@ async function pull() {
     }
     if (msgs.length < 200) break;
   }
-  if (received) touch();
+  if (received) { touch(); writeTranscript(); }
   return { reachable: true, received };
 }
 
@@ -404,6 +406,67 @@ function lastType(table) {
 function idleMinutes() {
   const t = get('last_activity_at');
   return t ? Math.round((Date.now() - Date.parse(t)) / 60000) : null;
+}
+
+// ---------- transcript ----------
+const TRANSCRIPT = path.join(DIR, 'transcript.md');
+function allRows() {
+  return [
+    ...db().prepare("SELECT 'you' AS who, id, type, re, body, created_at FROM outbox").all(),
+    ...db().prepare("SELECT 'peer' AS who, id, type, re, body, created_at FROM inbox").all(),
+  ].sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+// Human-readable copy of the whole conversation, rewritten whenever it changes.
+function writeTranscript() {
+  try {
+    const lines = [`# Relay transcript (session ${get('session_id').slice(0, 8)}, you are ${get('role')})`, ''];
+    for (const m of allRows()) {
+      lines.push(`## ${m.created_at.replace('T', ' ').slice(0, 19)} UTC · ${m.who === 'you' ? 'you → peer' : 'peer → you'} · ${m.type} #${m.id}${m.re ? ` (re #${m.re})` : ''}`, '', m.body, '');
+    }
+    fs.writeFileSync(TRANSCRIPT, lines.join('\n'));
+  } catch {}
+}
+
+// ---------- live view ----------
+const tty = process.stdout.isTTY;
+const c = (code, t) => (tty ? `\x1b[${code}m${t}\x1b[0m` : t);
+function printLive(m) {
+  const t = new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const dir = m.who === 'you' ? c('36', 'you → peer') : c('35', 'peer → you');
+  console.log(`\n${c('2', t)}  ${dir}  ${c('1', m.type)} #${m.id}${m.re ? c('2', ` re #${m.re}`) : ''}`);
+  console.log(m.body.split('\n').map((l) => '  ' + l).join('\n'));
+}
+async function watch(flags) {
+  session();
+  const last = flags.all ? Infinity : Number(flags.last || 5);
+  const rows = allRows();
+  if (rows.length > last) console.log(c('2', `(${rows.length - last} earlier messages hidden; --all shows everything)`));
+  for (const m of rows.slice(-last)) printLive(m);
+  let maxOut = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM outbox').get().n;
+  let maxIn = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM inbox').get().n;
+  const pullEvery = Math.max(5, Number(flags.every || 15));
+  console.log(c('2', `\n— watching. Checks the peer every ${pullEvery}s and shows both sides as messages land. Ctrl-C to stop. —`));
+  let lastState = null, lastPull = 0;
+  for (;;) {
+    if (Date.now() - lastPull >= pullEvery * 1000) {
+      lastPull = Date.now();
+      const p = await pull().catch((e) => ({ reachable: false, error: e.message }));
+      const state = p.reachable ? 'up' : `down: ${p.error}`;
+      if (state !== lastState) {
+        console.log(c('2', `\n· ${new Date().toLocaleTimeString()} peer ${p.reachable ? 'reachable' : 'unreachable (' + p.error + ')'}`));
+        lastState = state;
+      }
+    }
+    const fresh = [
+      ...db().prepare("SELECT 'you' AS who, * FROM outbox WHERE id > ?").all(maxOut),
+      ...db().prepare("SELECT 'peer' AS who, * FROM inbox WHERE id > ?").all(maxIn),
+    ].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    for (const m of fresh) {
+      printLive(m);
+      if (m.who === 'you') maxOut = Math.max(maxOut, m.id); else maxIn = Math.max(maxIn, m.id);
+    }
+    await sleep(2000);
+  }
 }
 
 // ---------- CLI ----------
@@ -436,7 +499,9 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
   inbox [--all]              Show unhandled (or all) received messages.
   ack <id...>                Mark received messages handled.
   brief [TEXT]               Show or append operator instructions (persist across context resets).
+  watch [--last N|--all]     Live view of the conversation, both directions, as it happens.
   log                        Full transcript, both directions, in time order.
+                             A readable copy is kept current at .relay/transcript.md.
   status                     Session, URLs, process health, counts.
   invite                     Reprint the invite for this session (host only).
   stop                       Stop the server and tunnel. Keeps state.
@@ -466,6 +531,7 @@ async function main() {
       console.log('Session hosted. Send this invite to your peer over a channel you trust (it contains the session key):\n');
       console.log(makeInvite(url, get('key'), get('session_id')));
       console.log('\nThey run: /relay join <invite>');
+      console.log(watchHint());
       return;
     }
 
@@ -496,7 +562,7 @@ async function main() {
       }
       const p = await pull();
       console.log(p.reachable
-        ? `Connected to session ${inv.sid.slice(0, 8)}. Both directions verified. Your endpoint: ${url}`
+        ? `Connected to session ${inv.sid.slice(0, 8)}. Both directions verified. Your endpoint: ${url}` + watchHint()
         : `Joined session ${inv.sid.slice(0, 8)}, but pulling from the host failed (${p.error}). \`tick\` will keep retrying.`);
       return;
     }
@@ -539,9 +605,12 @@ async function main() {
       const re = flags.re ? parseInt(flags.re, 10) : null;
       const r = db().prepare('INSERT INTO outbox (type, re, body, created_at) VALUES (?, ?, ?, ?)').run(type, re, body, now());
       touch();
+      writeTranscript();
       console.log(`queued #${r.lastInsertRowid} [${type}]. The peer receives it on their next tick.`);
       return;
     }
+
+    case 'watch': return watch(flags);
 
     case 'inbox': {
       const rows = flags.all ? db().prepare('SELECT * FROM inbox ORDER BY id').all() : unhandled();
@@ -570,10 +639,7 @@ async function main() {
     }
 
     case 'log': {
-      const rows = [
-        ...db().prepare("SELECT 'me' AS who, id, type, re, body, created_at FROM outbox").all(),
-        ...db().prepare("SELECT 'peer' AS who, id, type, re, body, created_at FROM inbox").all(),
-      ].sort((a, b) => a.created_at.localeCompare(b.created_at));
+      const rows = allRows();
       if (!rows.length) return console.log('no messages yet');
       for (const m of rows) console.log(fmtMsg(m, m.who));
       return;
@@ -588,6 +654,7 @@ async function main() {
         server_up: await localHealthy(), tunnel_up: get('mode') === 'local' ? null : !!pidAlive('tunnel.pid'),
         sent: c('outbox'), received: c('inbox'), unhandled: c('inbox', 'WHERE handled = 0'),
         peer_seen_at: get('peer_seen_at'), idle_minutes: idleMinutes(),
+        transcript: TRANSCRIPT, watch: `node ${SCRIPT} watch`,
       }, null, 2));
       return;
     }

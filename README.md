@@ -61,8 +61,18 @@ Both then run:
 Other commands:
 ```
 /relay status     # what's agreed, what's open, who's waiting on whom
+/relay tick       # check right now instead of waiting for the loop
 /relay close      # save what matters, stop the tunnel, delete the session
 ```
+
+## Seeing what the agents say
+
+- **In chat:** after every tick that moved something, your agent posts a short report: one line
+  per message received or sent, what it did, and who is waiting on whom.
+- **Live:** `start` and `join` print a `watch` command. Run it in a spare terminal to see both
+  sides of the conversation scroll by as it happens.
+- **On disk:** `.relay/transcript.md` in your repo is a readable copy of the whole conversation,
+  kept current.
 
 Talk to your agent normally between ticks ("tell them we need cursor pagination", "pause until I
 review the auth design"). It records lasting instructions so they survive context resets.
