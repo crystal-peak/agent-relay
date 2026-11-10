@@ -46,13 +46,23 @@ echo "$E" | grep "host rejected the handshake" >/dev/null || fail "forged join w
 RELAY_HOME=$C $R tick | grep '"peer_error": "peer answered 401"' >/dev/null || fail "forged key could read messages"
 RELAY_HOME=$C $R close --purge >/dev/null
 
+# Secrets are refused; placeholders are fine.
+RELAY_HOME=$A $R send update --body "DB_PASSWORD=correcthorsebatterystaple" >/dev/null 2>&1 && fail "secret was sent"
+RELAY_HOME=$A $R send update --body "--set DB_PASSWORD=<placeholder>" >/dev/null || fail "placeholder body refused"
+tick $B >/dev/null
+
+# Public health check doesn't reveal the session id.
+SID=$(node -e 'const o=JSON.parse(Buffer.from(process.argv[1].slice(7),"base64url"));console.log(o.s.slice(0,8))' "$INVITE")
+HURL=$(RELAY_HOME=$A $R status | grep '"own_url"' | cut -d'"' -f4)
+curl -s "$HURL/health" | grep "$SID" >/dev/null && fail "health leaks session id"
+
 # Transcript file is kept current on both sides.
 grep 'GET /users/:id' "$B/transcript.md" >/dev/null || fail "guest transcript missing message"
 grep 'Accepted.' "$A/transcript.md" >/dev/null || fail "host transcript missing reply"
 
 # watch shows existing history, then new messages from both sides as they land.
 W="$T/watch.out"
-RELAY_HOME=$A $R watch --last 1 --every 5 > "$W" 2>&1 & WPID=$!
+RELAY_HOME=$A $R watch --last 3 --every 5 > "$W" 2>&1 & WPID=$!
 sleep 3
 RELAY_HOME=$A $R send update --body "watch-outbound-marker" >/dev/null
 RELAY_HOME=$B $R send update --body "watch-inbound-marker" >/dev/null
@@ -64,21 +74,24 @@ grep watch-inbound-marker "$W" >/dev/null || fail "watch did not pull and show t
 tick $A >/dev/null   # consume the inbound marker so later counts stay simple
 
 # listen: one stdout line per new PEER message, nothing for our own sends, nothing else.
-L="$T/listen.out"; CW="$T/cwatch.out"
+L="$T/listen.out"; CW="$T/cwatch.out"; IW="$T/iwatch.out"
 RELAY_HOME=$A $R listen --every 5 > "$L" 2>/dev/null & LPID=$!
 RELAY_HOME=$A $R watch --compact --every 5 > "$CW" 2>/dev/null & CPID=$!
+RELAY_HOME=$A $R watch --compact --incoming --last 3 --every 5 > "$IW" 2>/dev/null & IPID=$!
 sleep 2
 RELAY_HOME=$A $R send update --body "listen-own-send" >/dev/null
 RELAY_HOME=$B $R send question --body $'listen-peer-one\nsecond line' >/dev/null
 RELAY_HOME=$B $R send update --body "listen-peer-two" >/dev/null
 for _ in $(seq 1 15); do grep listen-peer-two "$L" >/dev/null && break; sleep 1; done
 sleep 1
-kill $LPID $CPID 2>/dev/null; wait $LPID $CPID 2>/dev/null || true
+kill $LPID $CPID $IPID 2>/dev/null; wait $LPID $CPID $IPID 2>/dev/null || true
 [ "$(wc -l < "$L" | tr -d ' ')" = 2 ] || fail "listen should print exactly 2 lines: $(cat "$L")"
-grep -E '^relay [0-9:]+Z peer→you #[0-9]+ \[question\] listen-peer-one second line$' "$L" >/dev/null || fail "listen line format: $(cat "$L")"
+grep -E '^relay [0-9:]+Z ← received #[0-9]+ \[question\] listen-peer-one second line$' "$L" >/dev/null || fail "listen line format: $(cat "$L")"
 grep listen-own-send "$L" >/dev/null && fail "listen echoed our own message"
-grep 'you→peer.*listen-own-send' "$CW" >/dev/null || fail "compact watch missing our message: $(cat "$CW")"
-grep 'peer→you.*listen-peer-two' "$CW" >/dev/null || fail "compact watch missing peer message"
+grep '→ sent.*listen-own-send' "$CW" >/dev/null || fail "compact watch missing our message: $(cat "$CW")"
+grep '← received.*listen-peer-two' "$CW" >/dev/null || fail "compact watch missing peer message"
+grep 'listen-peer-two' "$IW" >/dev/null || fail "incoming watch missing peer message"
+grep 'sent' "$IW" >/dev/null && fail "incoming watch showed our own messages: $(cat "$IW")"
 tick $A >/dev/null
 
 # listen exits by itself when the session is closed.

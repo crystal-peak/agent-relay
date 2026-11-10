@@ -69,7 +69,10 @@ https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do
    - `own_error` set means this machine couldn't bring its tunnel up, usually because it is
      offline. Tell the operator once and keep the heartbeat.
 6. Stop the loop (ScheduleWakeup with `stop: true`) when `both_done` is true, or when
-   `idle_minutes` is over 180. Tell the operator why it stopped and summarize the outcome.
+   `idle_minutes` is over 180. Stop the listener and any watch with TaskStop. Then tell the
+   operator, in chat and with PushNotification if it is available: that the relay loop
+   stopped, why, a two-line outcome summary, and that `/loop /relay tick` restarts it. The
+   session stays intact, so restarting needs no new invite.
 7. If the peer has been unreachable for over an hour while your side is fine, both tunnels may
    have restarted while apart, so neither knows the other's new address. Tell your operator. The
    fix is under "`/relay invite` and reconnecting" below.
@@ -91,8 +94,10 @@ without involving you, and wakes you only when a message arrives.
   `relay 14:32:05Z peer→you #7 [question] Should GET /orders ...`. Run the full tick procedure
   right away, which handles the messages, reports, and replaces the heartbeat. Several events
   that arrive together need only one tick.
-- **When it expires** after 30 minutes, re-arm it on the next tick. The 20-minute heartbeat
-  guarantees a tick happens before the gap matters.
+- **When it expires** after 30 minutes, you get a notification. Re-arm it immediately with the
+  same settings, and tell the operator in one line, like `Relay listener renewed.` Don't wait
+  for the heartbeat. If re-arming fails, tell the operator plainly that live wake-ups are off
+  and the loop will check every 20 minutes until it works again.
 - **When the loop stops,** stop the listener too with TaskStop.
 - The listener also keeps this side's tunnel alive every two minutes, so the peer can reach you
   between heartbeats.
@@ -102,12 +107,19 @@ while waiting on the peer, 600 when the peer is unreachable, 1200 to 1800 when w
 operator.
 
 ### `/relay watch`
-For the operator to see the conversation in this chat. Arm a separate Monitor: command
-`node <base-dir>/scripts/relay.mjs watch --compact`, description `relay: conversation`,
-`timeout_ms` 1800000. Each event is one message from either side. Show each to the operator
-as a single line and take no other action on it. If a loop is running, its listener handles
-the work. Tell the operator it runs for 30 minutes, and that for a permanent live view they
-can run the `watch` command from `relay status` in a terminal.
+Shows the operator incoming messages in this chat as they land, without the agent acting on
+them. If a loop is running, say so and skip this: the loop's tick reports already show every
+message in both directions.
+
+Otherwise arm a Monitor: command `node <base-dir>/scripts/relay.mjs watch --compact --incoming`,
+description `relay: incoming`, `timeout_ms` 1800000. Each event is one received message. Show
+it to the operator as a single line and take no other action. When it expires, re-arm it
+immediately and say `Relay watch renewed.` in one line, until the operator says stop or a loop
+starts. For a view of both directions with full bodies, the operator can run the `watch`
+command from `relay status` in a terminal.
+
+You never see your own sent messages in any event stream. If something you receive looks like
+your own words, it is the peer quoting you.
 
 ### `/relay status`
 Run `relay status` and `relay log`, give the operator the watch command and transcript path
@@ -162,6 +174,10 @@ Send with `relay send <type> [--re <id>] --body "<text>"`, or pipe a long body o
 | `update` | Report progress: "implemented and tested GET /orders", "deployed to staging at <url>". |
 | `blocked` | You cannot continue. Say exactly what you need and from whom (peer or a human). |
 | `done` | Your side of the goal is complete. Summarize what was built and agreed. |
+
+If `send` refuses a body because it looks like a secret, rewrite it with placeholders such as
+`<API_KEY>` and send again. Use `--allow-secret` only after the operator has looked at the exact
+text and approved it.
 
 Every message must move the work forward. No acknowledgements, thanks, or "sounds good" on their
 own. If there is nothing to say, send nothing. Keep bodies specific: paths, field names, status

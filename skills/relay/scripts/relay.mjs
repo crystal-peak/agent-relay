@@ -120,11 +120,34 @@ const safeEq = (a, b) => {
 };
 const fresh = (ts) => Number.isFinite(ts) && Math.abs(Date.now() / 1000 - ts) <= CLOCK_SKEW_S;
 const otherRole = (r) => (r === 'host' ? 'guest' : 'host');
+// Identifies our own server on /health without revealing anything about the session.
+const healthTag = (sid) => crypto.createHash('sha256').update('agent-relay health ' + sid).digest('hex').slice(0, 12);
+const healthOk = (j, sid) => !!j?.ok && (j.s === healthTag(sid) || j.s === sid.slice(0, 8));
 
 function session() {
   const key = get('key'), sid = get('session_id'), role = get('role');
   if (!key || !sid || !role) throw new Error('no session. Run `start` (host) or `join <invite>` (guest) first.');
   return { sid, role, peer: otherRole(role), ...deriveKeys(key) };
+}
+
+// ---------- secret scan ----------
+// Last line of defense for "never send secrets". Refuses bodies that look like credentials.
+const SECRET_PATTERNS = [
+  ['private key block', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/],
+  ['GitHub token', /\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b/],
+  ['Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
+  ['Stripe secret key', /\b[rs]k_(live|test)_[A-Za-z0-9]{16,}/],
+  ['OpenAI/Anthropic-style API key', /\bsk-(ant-)?[A-Za-z0-9_-]{24,}/],
+  ['Google API key', /\bAIza[0-9A-Za-z_-]{35}\b/],
+  ['JSON web token', /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/],
+  ['extended private key', /\b[xtyz]prv[1-9A-HJ-NP-Za-km-z]{100,}/],
+  ['WIF private key', /(?<![1-9A-HJ-NP-Za-km-z])[5KLc][1-9A-HJ-NP-Za-km-z]{50,51}(?![1-9A-HJ-NP-Za-km-z])/],
+  ['URL with password', /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]{3,}@/i],
+  ['secret assignment', /\b[A-Z0-9_]*(SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|PRIVATE_?KEY)[A-Z0-9_]*\s*[:=]\s*["']?[^\s"'<>]{12,}/],
+];
+function findSecrets(text) {
+  return SECRET_PATTERNS.filter(([, re]) => re.test(text)).map(([name]) => name);
 }
 
 // ---------- invite ----------
@@ -155,7 +178,7 @@ function serve(port) {
   const server = http.createServer(async (req, res) => {
     try {
       const u = new URL(req.url, 'http://x');
-      if (req.method === 'GET' && u.pathname === '/health') return json(res, 200, { ok: true, s: s.sid.slice(0, 8) });
+      if (req.method === 'GET' && u.pathname === '/health') return json(res, 200, { ok: true, s: healthTag(s.sid) });
 
       if (req.method === 'GET' && u.pathname === '/messages') {
         // Auth: header "<ts>.<hmac>" over the exact request, signed by the peer.
@@ -263,8 +286,7 @@ async function localHealthy() {
   if (!port) return false;
   try {
     const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
-    const j = await r.json();
-    return j.ok && j.s === get('session_id').slice(0, 8);
+    return healthOk(await r.json(), get('session_id'));
   } catch { return false; }
 }
 
@@ -312,12 +334,12 @@ const watchHint = () =>
 // Block until our own tunnel URL answers /health from the public internet. Uses DNS-over-HTTPS
 // only, so an early miss can't get cached as NXDOMAIN by this machine's resolver.
 async function waitPublic(url, maxS = 90) {
-  const sid8 = get('session_id').slice(0, 8);
+  const sid = get('session_id');
   const t0 = Date.now();
   while ((Date.now() - t0) / 1000 < maxS) {
     try {
       const r = await request(url + '/health', { timeout: 5000, lookup: dohOnlyLookup });
-      if (r.ok && r.json().s === sid8) return;
+      if (r.ok && healthOk(r.json(), sid)) return;
     } catch {}
     await sleep(2000);
   }
@@ -350,7 +372,7 @@ async function upUnlocked() {
   if (pidAlive('tunnel.pid') && get('tunnel_port') === get('port') && before) {
     try {
       const r = await request(before + '/health', { timeout: 8000 });
-      if (r.ok && r.json().s === get('session_id').slice(0, 8)) return { url: before, changed: false };
+      if (r.ok && healthOk(r.json(), get('session_id'))) return { url: before, changed: false };
     } catch {}
   }
   killPid('tunnel.pid');
@@ -441,7 +463,7 @@ function writeTranscript() {
   try {
     const lines = [`# Relay transcript (session ${get('session_id').slice(0, 8)}, you are ${get('role')})`, ''];
     for (const m of allRows()) {
-      lines.push(`## ${m.created_at.replace('T', ' ').slice(0, 19)} UTC · ${m.who === 'you' ? 'you → peer' : 'peer → you'} · ${m.type} #${m.id}${m.re ? ` (re #${m.re})` : ''}`, '', m.body, '');
+      lines.push(`## ${m.created_at.replace('T', ' ').slice(0, 19)} UTC · ${m.who === 'you' ? '→ sent' : '← received'} · ${m.type} #${m.id}${m.re ? ` (re #${m.re})` : ''}`, '', m.body, '');
     }
     fs.writeFileSync(TRANSCRIPT, lines.join('\n'));
   } catch {}
@@ -452,7 +474,7 @@ const tty = process.stdout.isTTY;
 const c = (code, t) => (tty ? `\x1b[${code}m${t}\x1b[0m` : t);
 function printLive(m) {
   const t = new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const dir = m.who === 'you' ? c('36', 'you → peer') : c('35', 'peer → you');
+  const dir = m.who === 'you' ? c('36', '→ sent') : c('35', '← received');
   console.log(`\n${c('2', t)}  ${dir}  ${c('1', m.type)} #${m.id}${m.re ? c('2', ` re #${m.re}`) : ''}`);
   console.log(m.body.split('\n').map((l) => '  ' + l).join('\n'));
 }
@@ -460,7 +482,7 @@ function printLive(m) {
 function printCompact(m) {
   const t = new Date(m.created_at).toISOString().slice(11, 19);
   const gist = m.body.replace(/\s+/g, ' ').trim();
-  console.log(`relay ${t}Z ${m.who === 'you' ? 'you→peer' : 'peer→you'} #${m.id} [${m.type}]${m.re ? ` re #${m.re}` : ''} ${gist.length > 160 ? gist.slice(0, 157) + '...' : gist}`);
+  console.log(`relay ${t}Z ${m.who === 'you' ? '→ sent' : '← received'} #${m.id} [${m.type}]${m.re ? ` re #${m.re}` : ''} ${gist.length > 160 ? gist.slice(0, 157) + '...' : gist}`);
 }
 // watch:  human view of both sides (or --compact one-liners).
 // listen: event stream for an agent: only new peer messages, one line each, nothing else on stdout.
@@ -473,7 +495,7 @@ async function watch(flags, { listen = false } = {}) {
     const last = flags.all ? Infinity : Number(flags.last ?? (compact ? 0 : 5));
     const rows = allRows();
     if (rows.length > last && !compact) console.log(c('2', `(${rows.length - last} earlier messages hidden; --all shows everything)`));
-    if (last > 0) for (const m of rows.slice(-last)) show(m);
+    if (last > 0) for (const m of rows.filter((r) => !flags.incoming || r.who === 'peer').slice(-last)) show(m);
   }
   let maxOut = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM outbox').get().n;
   let maxIn = db().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM inbox').get().n;
@@ -496,7 +518,7 @@ async function watch(flags, { listen = false } = {}) {
       lastState = state;
     }
     const fresh = [
-      ...(listen ? [] : db().prepare("SELECT 'you' AS who, * FROM outbox WHERE id > ?").all(maxOut)),
+      ...(listen || flags.incoming ? [] : db().prepare("SELECT 'you' AS who, * FROM outbox WHERE id > ?").all(maxOut)),
       ...db().prepare("SELECT 'peer' AS who, * FROM inbox WHERE id > ?").all(maxIn),
     ].sort((a, b) => a.created_at.localeCompare(b.created_at));
     for (const m of fresh) {
@@ -508,13 +530,16 @@ async function watch(flags, { listen = false } = {}) {
 }
 
 // ---------- CLI ----------
+const VALUE_FLAGS = new Set(['body', 're', 'last', 'every']);
 function parseFlags(argv) {
   const flags = {}, pos = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const k = a.slice(2);
-      if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[k] = argv[++i];
+      // Value flags always take the next argument, even if it starts with dashes (a body can).
+      if (VALUE_FLAGS.has(k) && i + 1 < argv.length) flags[k] = argv[++i];
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[k] = argv[++i];
       else flags[k] = true;
     } else pos.push(a);
   }
@@ -533,12 +558,14 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
   join <invite> [--local]    Join a session from a peer's invite.
   tick                       Keep the tunnel alive, pull new messages, print status + unhandled inbox.
   send <type> [--re N] [--body TEXT]   Queue a message (body from --body or stdin).
+                             Refuses bodies that look like secrets unless --allow-secret.
                              types: ${TYPES.join(', ')}
   inbox [--all]              Show unhandled (or all) received messages.
   ack <id...>                Mark received messages handled.
   brief [TEXT]               Show or append operator instructions (persist across context resets).
-  watch [--last N|--all] [--compact]
-                             Live view of the conversation, both directions, as it happens.
+  watch [--last N|--all] [--compact] [--incoming]
+                             Live view of the conversation as it happens. Both directions unless
+                             --incoming. For humans; agents use listen.
   listen [--every S]         Event stream for agents: one line per new peer message, checked every
                              S seconds (default 10). Also keeps the tunnel alive. Runs until stopped.
   log                        Full transcript, both directions, in time order.
@@ -644,6 +671,11 @@ async function main() {
       const body = (typeof flags.body === 'string' ? flags.body : await readStdin()).trim();
       if (!body) throw new Error('empty body. Use --body TEXT or pipe the body on stdin.');
       if (Buffer.byteLength(body) > MAX_BODY) throw new Error(`body is over ${MAX_BODY} bytes; split it or reference a file both sides can see`);
+      const hits = findSecrets(body);
+      if (hits.length && !flags['allow-secret']) {
+        throw new Error(`refused: the body looks like it contains a secret (${hits.join(', ')}). ` +
+          'Replace real values with placeholders. If this is a false positive, the operator must approve resending with --allow-secret.');
+      }
       const re = flags.re ? parseInt(flags.re, 10) : null;
       const r = db().prepare('INSERT INTO outbox (type, re, body, created_at) VALUES (?, ?, ?, ?)').run(type, re, body, now());
       touch();

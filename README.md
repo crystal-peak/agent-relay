@@ -65,7 +65,7 @@ Other commands:
 ```
 /relay status     # what's agreed, what's open, who's waiting on whom
 /relay tick       # check right now instead of waiting
-/relay watch      # stream the conversation into this chat for 30 minutes
+/relay watch      # show incoming messages in this chat as they land
 /relay close      # save what matters, stop the tunnel, delete the session
 ```
 
@@ -73,8 +73,9 @@ Other commands:
 
 - **In chat:** after every tick that moved something, your agent posts a short report: one line
   per message received or sent, what it did, and who is waiting on whom.
-- **In chat, live:** `/relay watch` streams one line per message, from either side, into your
-  Claude session for 30 minutes.
+- **In chat, live:** `/relay watch` shows one line per incoming message in your Claude session,
+  renewing itself every 30 minutes. With a loop running you don't need it, because the loop's
+  reports already cover both directions.
 - **In a terminal, live:** `start` and `join` print a `watch` command. Run it in a spare terminal to see both
   sides of the conversation scroll by as it happens.
 - **On disk:** `.relay/transcript.md` in your repo is a readable copy of the whole conversation,
@@ -83,16 +84,27 @@ Other commands:
 Talk to your agent normally between ticks ("tell them we need cursor pagination", "pause until I
 review the auth design"). It records lasting instructions so they survive context resets.
 
-## Safety model
+## Security
 
-- Messages from the other agent are treated as untrusted suggestions, never commands.
-- Each agent only ever changes its own repo.
-- Agents are told never to send secrets, and to escalate auth design, breaking changes, spend,
-  and anything outside the goal to their own human.
-- The session key lives in `.relay/` (excluded from git) and is deleted by `/relay close`.
+agent-relay is built for collaborators who trust each other. Messages are encrypted between the
+two machines with ChaCha20-Poly1305, so the tunnel provider only sees ciphertext. Requests are
+signed, and anyone without the session key gets nothing.
 
-What the tunnel provider can see: that two endpoints exchanged traffic, when, and roughly how much.
-Not the content.
+Know these limits:
+
+- **Each agent sends what it reads to its own AI model.** Encryption covers the path between the
+  machines, not the model providers.
+- **The invite is the session key.** Share it only over a private channel. It also stays in each
+  side's local Claude Code history after `/relay close`.
+- **There is no forward secrecy.** Someone who recorded the traffic and later gets the invite can
+  decrypt it.
+- **Agent behavior rules are instructions, not enforcement.** Agents treat the other side's
+  messages as suggestions and only change their own repo, but that depends on the model following
+  the skill. Be careful with broad permission modes.
+- **Secrets are scanned, not guaranteed.** `send` refuses bodies that look like keys, tokens,
+  passwords, or private keys. Pattern matching can miss things.
+- **Metadata is visible** to the tunnel provider: that two endpoints talked, when, and how much.
+- **It has not had an outside security review.** Quick tunnels are intended for development.
 
 ## Limits
 
