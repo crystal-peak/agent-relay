@@ -117,4 +117,16 @@ RELAY_HOME=$B $R stop >/dev/null
 tick $B | grep '"peer_reachable": true' >/dev/null || fail "guest restart"
 tick $A | grep '"peer_reachable": true' >/dev/null || fail "host cannot reach restarted guest"
 
+# Closing one side notifies the other, which can then close its own side.
+OUT=$(RELAY_HOME=$A $R close --purge --body "load test finished" 2>&1)
+echo "$OUT" | grep "peer notified" >/dev/null || fail "host close did not notify: $OUT"
+[ -d "$A" ] && fail "host state not purged"
+OUT=$(RELAY_HOME=$B $R tick)
+echo "$OUT" | grep '"peer_closed": true' >/dev/null || fail "guest did not see peer_closed: $OUT"
+echo "$OUT" | grep '\[closed\]' >/dev/null || fail "guest missing closed message"
+echo "$OUT" | grep '> Reason: load test finished' >/dev/null || fail "close reason missing"
+RELAY_HOME=$B $R send closed --body x >/dev/null 2>&1 && fail "closed type should not be sendable"
+OUT=$(RELAY_HOME=$B $R close --purge 2>&1)
+echo "$OUT" | grep "peer already closed" >/dev/null || fail "guest close should skip notify: $OUT"
+
 echo "PASS (${MODE:-tunnel})"

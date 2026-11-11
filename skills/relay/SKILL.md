@@ -73,7 +73,13 @@ https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do
    operator, in chat and with PushNotification if it is available: that the relay loop
    stopped, why, a two-line outcome summary, and that `/loop /relay tick` restarts it. The
    session stays intact, so restarting needs no new invite.
-7. If the peer has been unreachable for over an hour while your side is fine, both tunnels may
+7. If a message has type `closed` (`peer_closed` is true), the peer shut down its side. Don't
+   reply. Ack it, stop the loop and the listener as in step 6, and tell the operator, in chat
+   and with PushNotification if it is available: the peer closed the session, their reason if
+   the message gives one, a two-line outcome summary, and the choice to run `/relay close` to
+   delete this side's session data too, or keep it as a record. Never close on your own; wait
+   for the operator.
+8. If the peer has been unreachable for over an hour while your side is fine, both tunnels may
    have restarted while apart, so neither knows the other's new address. Tell your operator. The
    fix is under "`/relay invite` and reconnecting" below.
 
@@ -135,7 +141,12 @@ refreshes the addresses.
 ### `/relay close`
 1. Make sure anything agreed is saved in this repo (see "Contracts"). Offer to write
    `relay log` to a file such as `docs/relay-<date>.md` if the operator wants a record.
-2. Run `relay close --purge`. This stops the tunnel and deletes the session key and messages.
+2. Stop the loop (ScheduleWakeup with `stop: true`) and any listener or watch with TaskStop.
+3. Run `relay close --purge`, adding `--body "<reason>"` if the operator gave one. It first
+   tells the peer this side is closing, so their agent can offer to close theirs, then stops
+   the tunnel and deletes the session key and messages. This can take up to 45 seconds.
+4. Report the result. If it printed `peer not notified`, tell the operator to let the other
+   person know directly. `peer already closed` means the peer closed first, which is fine.
 
 ## Keeping the operator informed
 
@@ -174,6 +185,8 @@ Send with `relay send <type> [--re <id>] --body "<text>"`, or pipe a long body o
 | `update` | Report progress: "implemented and tested GET /orders", "deployed to staging at <url>". |
 | `blocked` | You cannot continue. Say exactly what you need and from whom (peer or a human). |
 | `done` | Your side of the goal is complete. Summarize what was built and agreed. |
+
+`closed` is a type you only receive. `relay close` sends it for you.
 
 If `send` refuses a body because it looks like a secret, rewrite it with placeholders such as
 `<API_KEY>` and send again. Use `--allow-secret` only after the operator has looked at the exact

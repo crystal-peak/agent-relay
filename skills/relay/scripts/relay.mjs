@@ -22,7 +22,9 @@ import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(import.meta.url);
-const TYPES = ['proposal', 'question', 'answer', 'accept', 'reject', 'update', 'blocked', 'done'];
+const SEND_TYPES = ['proposal', 'question', 'answer', 'accept', 'reject', 'update', 'blocked', 'done'];
+// 'closed' is written only by `close`, never by `send`.
+const TYPES = [...SEND_TYPES, 'closed'];
 const MAX_BODY = 60_000;
 const CLOCK_SKEW_S = 300;
 const FETCH_TIMEOUT_MS = 15_000;
@@ -188,6 +190,7 @@ function serve(port) {
         const expect = hmac(s.mac, `${s.sid}|${s.peer}|GET /messages|${after}|${ts}`);
         if (!fresh(ts) || !safeEq(sig, expect)) return json(res, 401, { error: 'unauthorized' });
         const rows = db().prepare('SELECT id, type, re, body, created_at FROM outbox WHERE id > ? ORDER BY id LIMIT 200').all(after);
+        if (rows.length) set('peer_fetched_through', rows[rows.length - 1].id);
         const env = seal(s.enc, { messages: rows }, `${s.sid}|messages|${s.role}|${after}|${ts}`);
         return json(res, 200, env);
       }
@@ -200,6 +203,15 @@ function serve(port) {
         set('peer_url', msg.url.replace(/\/+$/, ''));
         set('peer_seen_at', now());
         return json(res, 200, { ok: true });
+      }
+      if (req.method === 'POST' && u.pathname === '/closed') {
+        // Peer is closing. Pull right away, while its server is still up, so its final
+        // 'closed' message (and anything before it) lands in our inbox.
+        const env = JSON.parse(await readBody(req));
+        const msg = unseal(s.enc, env, `${s.sid}|closed|${s.peer}`);
+        if (!fresh(msg.ts)) return json(res, 400, { error: 'stale' });
+        const p = await pull();
+        return json(res, p.reachable ? 200 : 502, { ok: p.reachable });
       }
       json(res, 404, { error: 'not found' });
     } catch (e) {
@@ -399,6 +411,37 @@ async function announce() {
   } catch (e) { return { ok: false, error: errCode(e) }; }
 }
 
+// Queue a 'closed' message and get it to the peer before our server goes away.
+// Fast path: POST /closed makes the peer pull immediately. Peers on 0.1.4 or older answer 404;
+// for them, keep serving for up to 30s so their listener (every 10s) can pull it.
+async function notifyClosed(reason) {
+  const s = session();
+  if (!get('peer_url')) return { notified: false, why: 'peer never connected' };
+  if (lastType('inbox') === 'closed') return { notified: false, why: 'peer already closed' };
+  const purgeNote = reason.purge ? 'its session data is deleted' : 'its session data is kept';
+  const body = `The ${s.role} closed its side of the relay session (${purgeNote}).` +
+    (reason.text ? `\nReason: ${reason.text}` : '') +
+    '\nNothing more will arrive from it. You can close your side with /relay close.';
+  const id = Number(db().prepare('INSERT INTO outbox (type, re, body, created_at) VALUES (?, NULL, ?, ?)').run('closed', body, now()).lastInsertRowid);
+  touch(); writeTranscript();
+  const env = seal(s.enc, { ts: Math.floor(Date.now() / 1000) }, `${s.sid}|closed|${s.role}`);
+  let status;
+  try {
+    const r = await request(get('peer_url') + '/closed', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(env), timeout: 45_000,
+    });
+    status = r.status;
+  } catch (e) { status = errCode(e); }
+  const fetched = () => Number(get('peer_fetched_through') || 0) >= id;
+  if (fetched()) return { notified: true };
+  if (status === 404) {
+    process.stderr.write('Peer runs an older relay version. Waiting up to 30s for it to pick up the close notice...\n');
+    for (let i = 0; i < 30 && !fetched(); i++) await sleep(1000);
+    if (fetched()) return { notified: true };
+  }
+  return { notified: false, why: typeof status === 'number' ? `peer answered ${status}` : `peer unreachable (${status})` };
+}
+
 // ---------- pull ----------
 async function pull() {
   const s = session();
@@ -559,7 +602,7 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
   tick                       Keep the tunnel alive, pull new messages, print status + unhandled inbox.
   send <type> [--re N] [--body TEXT]   Queue a message (body from --body or stdin).
                              Refuses bodies that look like secrets unless --allow-secret.
-                             types: ${TYPES.join(', ')}
+                             types: ${SEND_TYPES.join(', ')}
   inbox [--all]              Show unhandled (or all) received messages.
   ack <id...>                Mark received messages handled.
   brief [TEXT]               Show or append operator instructions (persist across context resets).
@@ -573,7 +616,9 @@ const HELP = `agent-relay — encrypted messaging between two Claude Code agents
   status                     Session, URLs, process health, counts.
   invite                     Reprint the invite for this session (host only).
   stop                       Stop the server and tunnel. Keeps state.
-  close [--purge]            Stop, and with --purge delete all relay state for this repo.
+  close [--purge] [--body REASON] [--no-notify]
+                             Tell the peer this side is closing (they get a 'closed' message and
+                             can close theirs), then stop. --purge also deletes all relay state.
 
   --local uses http://127.0.0.1 instead of a cloudflared tunnel (same-machine testing).
   State lives in <repo>/.relay (override with RELAY_HOME).`;
@@ -652,6 +697,7 @@ async function main() {
         received_now: p.received, unhandled: pending.length,
         last_sent: lastType('outbox'), last_received: lastType('inbox'),
         both_done: lastType('outbox') === 'done' && lastType('inbox') === 'done',
+        peer_closed: lastType('inbox') === 'closed',
         idle_minutes: idleMinutes(),
       };
       console.log(JSON.stringify(out, null, 2));
@@ -667,7 +713,7 @@ async function main() {
     case 'send': {
       session();
       const type = pos[0];
-      if (!TYPES.includes(type)) throw new Error(`type must be one of: ${TYPES.join(', ')}`);
+      if (!SEND_TYPES.includes(type)) throw new Error(`type must be one of: ${SEND_TYPES.join(', ')}`);
       const body = (typeof flags.body === 'string' ? flags.body : await readStdin()).trim();
       if (!body) throw new Error('empty body. Use --body TEXT or pipe the body on stdin.');
       if (Buffer.byteLength(body) > MAX_BODY) throw new Error(`body is over ${MAX_BODY} bytes; split it or reference a file both sides can see`);
@@ -737,6 +783,17 @@ async function main() {
     case 'stop':
     case 'close': {
       if (!fs.existsSync(DIR)) return console.log(`no relay session in ${path.dirname(DIR)}`);
+      if (cmd === 'close' && !flags['no-notify'] && fs.existsSync(DB_PATH)) {
+        const text = typeof flags.body === 'string' ? flags.body.trim() : '';
+        if (text && findSecrets(text).length) throw new Error('refused: the close reason looks like it contains a secret.');
+        let n;
+        try {
+          // Our server and tunnel must be up for the peer to fetch the notice.
+          if (get('peer_url')) { await up(); if (get('announced_url') !== get('own_url')) await announce(); }
+          n = await notifyClosed({ purge: !!flags.purge, text });
+        } catch (e) { n = { notified: false, why: e.message }; }
+        console.log(n.notified ? 'peer notified that this side closed.' : `peer not notified: ${n.why}.`);
+      }
       killPid('tunnel.pid');
       killPid('server.pid');
       if (cmd === 'close' && flags.purge) {

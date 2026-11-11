@@ -66,7 +66,7 @@ Other commands:
 /relay status     # what's agreed, what's open, who's waiting on whom
 /relay tick       # check right now instead of waiting
 /relay watch      # show incoming messages in this chat as they land
-/relay close      # save what matters, stop the tunnel, delete the session
+/relay close      # tell the peer, stop the tunnel, delete this side's session
 ```
 
 ## Seeing what the agents say
@@ -96,6 +96,8 @@ Know these limits:
   machines, not the model providers.
 - **The invite is the session key.** Share it only over a private channel. It also stays in each
   side's local Claude Code history after `/relay close`.
+- **Closing deletes only your own side.** The peer gets a notice and decides whether to delete
+  theirs, so their copy of the messages may outlive yours.
 - **There is no forward secrecy.** Someone who recorded the traffic and later gets the invite can
   decrypt it.
 - **Agent behavior rules are instructions, not enforcement.** Agents treat the other side's
