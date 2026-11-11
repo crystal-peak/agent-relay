@@ -22,6 +22,7 @@ import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(import.meta.url);
+const VERSION = '0.1.6';
 const SEND_TYPES = ['proposal', 'question', 'answer', 'accept', 'reject', 'update', 'blocked', 'done'];
 // 'closed' is written only by `close`, never by `send`.
 const TYPES = [...SEND_TYPES, 'closed'];
@@ -220,6 +221,7 @@ function serve(port) {
   });
   server.listen(port, '127.0.0.1', () => {
     fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid));
+    set('server_version', VERSION);
   });
 }
 
@@ -302,10 +304,20 @@ async function localHealthy() {
   } catch { return false; }
 }
 
+const portFree = (p) => new Promise((resolve) => {
+  const srv = net.createServer();
+  srv.once('error', () => resolve(false));
+  srv.listen(p, '127.0.0.1', () => srv.close(() => resolve(true)));
+});
 async function startServer() {
-  if (await localHealthy()) return;
+  // A server left running by an older version of this script is replaced, on the same port
+  // when possible so the tunnel (and the URL the peer knows) survives the upgrade.
+  if (await localHealthy() && get('server_version') === VERSION) return;
   killPid('server.pid');
-  const port = await freePort();
+  const old = Number(get('port'));
+  let port = 0;
+  if (old) for (let i = 0; i < 20 && !port; i++) { if (await portFree(old)) port = old; else await sleep(100); }
+  if (!port) port = await freePort();
   set('port', port);
   const log = fs.openSync(path.join(DIR, 'server.log'), 'a');
   const child = spawn(process.execPath, [SCRIPT, '_serve', String(port)], {
